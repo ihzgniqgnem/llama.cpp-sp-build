@@ -415,6 +415,8 @@ jobs:
         with:
           path: artifact
           merge-multiple: true
+          skip-decompress: true
+          github-token: ${{ github.token }}
 
       - name: Merge / rename / build all-in-one package
         run: |

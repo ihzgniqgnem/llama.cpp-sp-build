@@ -1,0 +1,512 @@
+name: Build llama.cpp Windows backends (GGML_BACKEND_DL)
+
+# 手动触发：在 Actions 页面点 "Run workflow"
+# 构建方式与 ggml-org/llama.cpp 官方 release 工作流保持一致：
+#   - CPU      : windows-2025 + LLVM/clang 工具链 + GGML_CPU_ALL_VARIANTS（多指令集变体 DLL）
+#   - Vulkan   : windows-2025 + LunarG Vulkan SDK
+#   - OpenVINO : windows-2022 + OpenVINO 归档 + vcpkg(OpenCL)
+#   - SYCL     : windows-2022 + Intel oneAPI(DPC++/MKL/TBB/oneDNN) + Level Zero SDK
+# 全部使用 GitHub 免费标准 runner（公开仓库无额度限制），无任何付费 larger-runner。
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp ref：分支名 / tag / 40 位 commit SHA（默认 master 最新）'
+        required: false
+        default: 'master'
+      release_tag:
+        description: '自定义 Release tag（留空则自动生成 b<run_number>-<llama短SHA>）'
+        required: false
+        default: ''
+      prerelease:
+        description: '标记为 pre-release（不勾选则发布为正式 Release）'
+        required: false
+        type: boolean
+        default: false
+
+# 同一时刻只跑一个，避免并发排队/冲突
+concurrency:
+  group: build-windows-backends
+  cancel-in-progress: false
+
+env:
+  # ================= 依赖版本（与 llama.cpp master 的 .github/workflows/release.yml 同步） =================
+  VULKAN_VERSION: '1.4.357.0'
+  OPENVINO_VERSION_MAJOR: '2026.4.1'
+  OPENVINO_VERSION_FULL: '2026.4.1.22982.07f9c262b05'
+  LLVM_CHOCO_VERSION: '22.1.8'
+  WINDOWS_DLE_URL: 'https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b177a006-5cd9-4cb2-807f-8199cc73d53c/intel-deep-learning-essentials-2026.2.0.638_offline.exe'
+  WINDOWS_ONEDNN_URL: 'https://registrationcenter-download.intel.com/akdlm/IRC_NAS/8f905666-c85c-43fb-9bd0-2618c7ecd33b/intel-onednn-2026.1.0.622_offline.exe'
+  WINDOWS_DPCPP_MKL: 'intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.tbb.devel'
+  WINDOWS_DNNL: 'intel.oneapi.win.dnnl'
+  LEVEL_ZERO_SDK_URL: 'https://github.com/oneapi-src/level-zero/releases/download/v1.34.0/level-zero-win-sdk-1.34.0.zip'
+  ONEAPI_ROOT: 'C:/Program Files (x86)/Intel/oneAPI'
+
+jobs:
+  prepare:
+    name: 解析 llama.cpp 版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      sha_short: ${{ steps.resolve.outputs.sha_short }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve ref -> commit SHA
+        id: resolve
+        run: |
+          ref="${{ github.event.inputs.llama_ref || 'master' }}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            sha="$ref"
+          else
+            peeled=$(git ls-remote https://github.com/ggml-org/llama.cpp "$ref" | awk '/\^\{\}/ {print $1}' | head -1)
+            plain=$(git ls-remote https://github.com/ggml-org/llama.cpp "$ref" | awk '!/\^\{\}/ {print $1}' | head -1)
+            sha="${peeled:-$plain}"
+          fi
+          if [ -z "$sha" ]; then
+            echo "::error::无法解析 llama.cpp ref: ${ref}（支持分支名 / tag / 40 位 commit SHA）"
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "resolved: ${ref} -> ${sha}"
+
+  build-cpu:
+    name: 构建 CPU 后端 (ALL_VARIANTS)
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Clone sp-build 仓库（取 scripts）
+        uses: actions/checkout@v6
+
+      - name: Clone llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C llama.cpp fetch --depth 1 origin ${{ needs.prepare.outputs.sha }}
+          git -C llama.cpp checkout FETCH_HEAD
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=${{ env.LLVM_CHOCO_VERSION }} -y
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: Locate MSVC (vcvarsall)
+        shell: pwsh
+        run: |
+          $vcdir = (vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          $vcvarsall = Join-Path $vcdir 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path $vcvarsall)) { Write-Error "vcvarsall.bat not found"; exit 1 }
+          "VCVARSALL=$vcvarsall" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build (GGML_BACKEND_DL, CPU 全变体)
+        shell: cmd
+        working-directory: llama.cpp
+        run: |
+          call "%VCVARSALL%" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DGGML_RPC=ON ^
+            -DLLAMA_CONNECT=ON
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack
+        working-directory: llama.cpp
+        run: 7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-cpu-x64
+          path: llama.cpp/llama-bin-win-cpu-x64.zip
+          archive: false
+
+  build-vulkan:
+    name: 构建 Vulkan 后端
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Clone sp-build 仓库
+        uses: actions/checkout@v6
+
+      - name: Clone llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C llama.cpp fetch --depth 1 origin ${{ needs.prepare.outputs.sha }}
+          git -C llama.cpp checkout FETCH_HEAD
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build (GGML_BACKEND_DL, Vulkan)
+        shell: cmd
+        working-directory: llama.cpp
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" ^
+            -A x64 ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=OFF ^
+            -DLLAMA_BUILD_SERVER=OFF
+          cmake --build build --config Release --target ggml-vulkan
+
+      - name: Pack
+        working-directory: llama.cpp
+        run: 7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\ggml-vulkan.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-vulkan-x64
+          path: llama.cpp/llama-bin-win-vulkan-x64.zip
+          archive: false
+
+  build-openvino:
+    name: 构建 OpenVINO 后端
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Clone sp-build 仓库
+        uses: actions/checkout@v6
+
+      - name: Clone llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C llama.cpp fetch --depth 1 origin ${{ needs.prepare.outputs.sha }}
+          git -C llama.cpp checkout FETCH_HEAD
+
+      - name: Cache OpenVINO toolkit
+        id: cache-openvino
+        uses: actions/cache@v5
+        with:
+          path: llama.cpp/openvino_toolkit
+          key: openvino-toolkit-${{ env.OPENVINO_VERSION_FULL }}-win
+
+      - name: Download OpenVINO toolkit
+        if: steps.cache-openvino.outputs.cache-hit != 'true'
+        working-directory: llama.cpp
+        run: |
+          $url = "https://storage.openvinotoolkit.org/repositories/openvino/packages/${env:OPENVINO_VERSION_MAJOR}/windows/openvino_toolkit_windows_${env:OPENVINO_VERSION_FULL}_x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile openvino.zip
+          Expand-Archive -Path openvino.zip -DestinationPath openvino_toolkit -Force
+          Remove-Item openvino.zip
+
+      - name: Install OpenCL using vcpkg
+        shell: powershell
+        run: |
+          git clone https://github.com/microsoft/vcpkg C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
+          C:\vcpkg\vcpkg install opencl
+
+      - name: Build (GGML_BACKEND_DL, OpenVINO)
+        shell: cmd
+        working-directory: llama.cpp
+        run: |
+          REM 动态定位解压后的 OpenVINO 目录
+          for /d %%i in (openvino_toolkit\*) do set OPENVINO_ROOT=%%i
+
+          if not exist "%OPENVINO_ROOT%\runtime\cmake\OpenVINOConfig.cmake" (
+              echo ERROR: OpenVINOConfig.cmake not found
+              exit /b 1
+          )
+
+          call "%OPENVINO_ROOT%\setupvars.bat"
+
+          cmake -B build\ReleaseOV -G "Visual Studio 17 2022" ^
+            -A x64 ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_OPENVINO=ON ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+
+          cmake --build build\ReleaseOV --config Release --target ggml-openvino -- /m
+
+      - name: Pack（含 OpenVINO 运行时 DLL）
+        shell: powershell
+        working-directory: llama.cpp
+        run: |
+          # 动态定位 OpenVINO 根目录（与 Build 步骤一致）
+          $OPENVINO_ROOT = (Get-ChildItem -Directory openvino_toolkit | Select-Object -First 1).FullName
+          if (-not $OPENVINO_ROOT) {
+            Write-Error "OpenVINO toolkit folder not found under .\openvino_toolkit"
+            exit 1
+          }
+
+          $dest = ".\build\ReleaseOV\bin\Release"
+
+          $ovBin = Join-Path $OPENVINO_ROOT 'runtime\bin\intel64\Release'
+          Copy-Item -Path (Join-Path $ovBin '*.dll')       -Destination $dest -Force
+          Copy-Item -Path (Join-Path $ovBin 'cache.json') -Destination $dest -Force
+
+          $tbbBin = Join-Path $OPENVINO_ROOT 'runtime\3rdparty\tbb\bin'
+          Copy-Item -Path (Join-Path $tbbBin 'tbb*.dll') -Destination $dest -Force
+
+          # OpenVINO 许可文件
+          $licensingDest = Join-Path $dest 'openvino-licensing'
+          New-Item -ItemType Directory -Force -Path $licensingDest | Out-Null
+          Copy-Item -Path (Join-Path $OPENVINO_ROOT 'docs\licensing\*') -Destination $licensingDest -Recurse -Force
+
+          Copy-Item LICENSE $dest
+          7z a -snl llama-bin-win-openvino-x64.zip $dest\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-openvino-x64
+          path: llama.cpp/llama-bin-win-openvino-x64.zip
+          archive: false
+
+  build-sycl:
+    name: 构建 SYCL 后端 (oneAPI)
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Clone sp-build 仓库（取 scripts/install-oneapi.bat）
+        uses: actions/checkout@v6
+
+      - name: Clone llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C llama.cpp fetch --depth 1 origin ${{ needs.prepare.outputs.sha }}
+          git -C llama.cpp checkout FETCH_HEAD
+
+      - name: Download & Install oneAPI
+        run: |
+          scripts/install-oneapi.bat $WINDOWS_DLE_URL $WINDOWS_DPCPP_MKL
+          scripts/install-oneapi.bat $WINDOWS_ONEDNN_URL $WINDOWS_DNNL
+
+      - name: Install Level Zero SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile "level-zero-win-sdk.zip"
+          Expand-Archive -Path "level-zero-win-sdk.zip" -DestinationPath "C:/level-zero-sdk" -Force
+          "LEVEL_ZERO_V1_SDK_PATH=C:/level-zero-sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build (GGML_BACKEND_DL, SYCL)
+        shell: cmd
+        working-directory: llama.cpp
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G "Ninja" -B build ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_BACKEND_DL=ON ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DGGML_CPU=OFF ^
+            -DGGML_SYCL=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_TOOLS=OFF ^
+            -DLLAMA_BUILD_SERVER=OFF
+          cmake --build build --target ggml-sycl -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack（含 oneAPI 运行时 DLL）
+        working-directory: llama.cpp
+        run: |
+          echo "cp oneAPI running time dll files in ${{ env.ONEAPI_ROOT }} to ./build/bin"
+
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_sycl_blas.6.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_core.3.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_def.3.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_avx2.3.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_tbb_thread.3.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/mkl_intel_thread.3.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/mkl/latest/bin/libimalloc.dll" ./build/bin
+
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_adapter_level_zero.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_adapter_level_zero_v2.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_loader_shared.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/ur_win_proxy_loader.dll" ./build/bin
+          ZE_LOADER_DLL=$(find "${{ env.ONEAPI_ROOT }}" "$LEVEL_ZERO_V1_SDK_PATH" -iname ze_loader.dll -print -quit 2>/dev/null || true)
+          if [ -n "$ZE_LOADER_DLL" ]; then
+            echo "Using Level Zero loader: $ZE_LOADER_DLL"
+            cp "$ZE_LOADER_DLL" ./build/bin
+          else
+            echo "Level Zero loader DLL not found in oneAPI or SDK; relying on system driver/runtime"
+          fi
+
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/sycl9.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/svml_dispmd.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/libmmd.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/libiomp5md.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/compiler/latest/bin/sycl-ls.exe" ./build/bin
+
+          cp "${{ env.ONEAPI_ROOT }}/dnnl/latest/bin/dnnl.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/tbb/latest/bin/tbb12.dll" ./build/bin
+
+          cp "${{ env.ONEAPI_ROOT }}/tcm/latest/bin/tcm.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/tcm/latest/bin/libhwloc-15.dll" ./build/bin
+          cp "${{ env.ONEAPI_ROOT }}/umf/latest/bin/umf.dll" ./build/bin
+
+          echo "cp oneAPI running time dll files to ./build/bin done"
+          7z a -snl llama-bin-win-sycl-x64.zip ./build/bin/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-sycl-x64
+          path: llama.cpp/llama-bin-win-sycl-x64.zip
+          archive: false
+
+  release:
+    name: 打包并发布 Release
+    needs: [prepare, build-cpu, build-vulkan, build-openvino, build-sycl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # 创建 Release / 上传资产需要写权限
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Determine tag
+        run: |
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "TAG=${{ github.event.inputs.release_tag }}" >> "$GITHUB_ENV"
+          else
+            echo "TAG=b${{ github.run_number }}-${{ needs.prepare.outputs.sha_short }}" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            echo "PRERELEASE_FLAG=--prerelease" >> "$GITHUB_ENV"
+          else
+            echo "PRERELEASE_FLAG=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifact
+          merge-multiple: true
+
+      - name: Merge / rename / build all-in-one package
+        run: |
+          set -euxo pipefail
+          ls -l artifact/
+
+          cpu_zip="artifact/llama-bin-win-cpu-x64.zip"
+          for f in "$cpu_zip" \
+                   artifact/llama-bin-win-vulkan-x64.zip \
+                   artifact/llama-bin-win-openvino-x64.zip \
+                   artifact/llama-bin-win-sycl-x64.zip; do
+            if [ ! -f "$f" ]; then echo "::error::missing artifact $f"; exit 1; fi
+          done
+
+          # 1) 把 CPU 全套二进制（llama-server/cli 等 + ggml-cpu 变体）注入各后端 zip，
+          #    使每个 zip 自包含（官方 llama.cpp release 的做法）
+          tmp=$(mktemp -d)
+          unzip -q "$cpu_zip" -d "$tmp"
+          for target_zip in artifact/llama-bin-win-vulkan-x64.zip \
+                            artifact/llama-bin-win-openvino-x64.zip \
+                            artifact/llama-bin-win-sycl-x64.zip; do
+            (cd "$tmp" && zip -q -r "$(realpath "$target_zip")" .)
+          done
+          rm -rf "$tmp"
+
+          # 2) ALL-in-one：CPU 基底 + 三个后端 zip 依次覆盖合成
+          all_dir=release_all
+          mkdir -p "$all_dir"
+          unzip -q "$cpu_zip" -d "$all_dir"
+          for target_zip in artifact/llama-bin-win-vulkan-x64.zip \
+                            artifact/llama-bin-win-openvino-x64.zip \
+                            artifact/llama-bin-win-sycl-x64.zip; do
+            unzip -q -o "$target_zip" -d "$all_dir"
+          done
+
+          # 3) 统一重命名放入 release/
+          mkdir -p release
+          for zip_file in "$cpu_zip" \
+                           artifact/llama-bin-win-vulkan-x64.zip \
+                           artifact/llama-bin-win-openvino-x64.zip \
+                           artifact/llama-bin-win-sycl-x64.zip; do
+            base=$(basename "$zip_file" .zip)       # llama-bin-win-<backend>-x64
+            backend=${base#llama-bin-win-}
+            backend=${backend%-x64}
+            mv "$zip_file" "release/llama-${TAG}-bin-win-${backend}-x64.zip"
+          done
+          (cd "$all_dir" && zip -q -r "../release/llama-${TAG}-bin-win-all-backends-x64.zip" .)
+
+          # 4) 校验和
+          (cd release && sha256sum *.zip > SHA256SUMS.txt)
+          ls -l release/
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          # llama.cpp Windows amd64 后端构建（GGML_BACKEND_DL）
+
+          - 上游：[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) @ SHA
+          - 构建参数：`GGML_BACKEND_DL=ON`（各后端编译为独立 `ggml-*.dll`，运行时自动发现加载）
+          - 依赖：Vulkan SDK 1.4.357.0 / OpenVINO 2026.4.1 / Intel oneAPI（DPC++ 2026.2 + oneDNN 2026.1 + MKL/TBB）/ LLVM 22.1.8（CPU 变体编译）
+
+          ## 产物
+
+          | 文件 | 内容 |
+          |---|---|
+          | `*-bin-win-cpu-x64.zip` | 全套 llama 工具（server/cli 等）+ `ggml-cpu-*.dll` 多指令集变体（x64/sse42/…/alderlake，自动按 CPU 调度） |
+          | `*-bin-win-vulkan-x64.zip` | 全套 + `ggml-vulkan.dll`（需本机 Vulkan 显卡驱动） |
+          | `*-bin-win-openvino-x64.zip` | 全套 + `ggml-openvino.dll` + OpenVINO 运行时 DLL（开箱即用） |
+          | `*-bin-win-sycl-x64.zip` | 全套 + `ggml-sycl.dll` + oneAPI 运行时 DLL（需 Intel GPU 驱动；可用 `ONEAPI_DEVICE_SELECTOR` 选择设备） |
+          | `*-bin-win-all-backends-x64.zip` | 以上全部后端合一（运行时自动探测可用后端） |
+          | `SHA256SUMS.txt` | 全部产物的校验和 |
+
+          ## 使用说明
+
+          1. 解压任意 zip 到同一目录；`ggml-*.dll` 必须与 `llama-server.exe` 等可执行文件放在同一目录（GGML_BACKEND_DL 机制自动加载）。
+          2. CPU 包兼容老 CPU（SSE4.2 起）；Vulkan/SYCL 需要相应显卡驱动；OpenVINO/SYCL 的运行时 DLL 已随包附带。
+          3. `unzip -o` 合并包时相同文件以 CPU 包为准。
+
+          > 版本/依赖配置与上游 release 配方同步，如需更新依赖版本请对照 llama.cpp `release.yml`。
+          NOTES
+          # 填入具体 SHA 信息
+          sed -i "s|SHA|${{ needs.prepare.outputs.sha }}|g" notes.md
+          cat notes.md
+
+      - name: Create GitHub Release
+        run: |
+          if ! gh release create "$TAG" release/*.zip release/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "llama.cpp ${{ needs.prepare.outputs.sha_short }} Windows amd64 backends" \
+              --notes-file notes.md $PRERELEASE_FLAG ; then
+            echo "::error::创建 Release 失败。最常见原因：仓库 GITHUB_TOKEN 仍为只读权限 —— 请到 Settings → Actions → General → Workflow permissions 选择 \"Read and write permissions\" 保存，然后在本 run 页面点 \"Re-run failed jobs\"。"
+            exit 1
+          fi
+          echo "Release created: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
